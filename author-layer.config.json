@@ -1,0 +1,17 @@
+{
+  "layerDir": "作者层",
+  "stateFile": "tavern-cards-state.json",
+  "cardConfigFile": "card-build.config.json",
+  "ruleFiles": [
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "cardFields": [
+    { "key": "name", "file": "名称.txt", "label": "卡面 · 名称" },
+    { "key": "description", "file": "描述.txt", "label": "卡面 · 描述" },
+    { "key": "personality", "file": "性格.txt", "label": "卡面 · 性格" },
+    { "key": "scenario", "file": "场景.txt", "label": "卡面 · 场景" },
+    { "key": "first_mes", "file": "开场白.txt", "label": "卡面 · 开场白" },
+    { "key": "mes_example", "file": "对话示例.txt", "label": "卡面 · 对话示例" }
+  ]
+}
