@@ -87,7 +87,9 @@ function ensureGitIgnore() {
   }
 }
 
-ensureGitIgnore();
+const isSyncCommand = process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename
+  && process.argv[2] === 'sync';
+if (!isSyncCommand) ensureGitIgnore();
 
 const ruleStart = '<!-- 作者层规则 开始';
 const ruleEnd = '<!-- 作者层规则 结束 -->';
@@ -150,7 +152,7 @@ function layerFiles(dir, prefix = '', knownNames = new Set()) {
 }
 
 // 先检查所有旧正文/停用/快照，再执行迁移。歧义和已有目标都保留原文件。
-function migrateLegacy(rows) {
+function migrateLegacy(rows, commit = true) {
   const entries = rows.filter((row) => row.kind === 'entry');
   const legacyNames = new Set(entries.map((row) => row.legacyName).filter(Boolean));
   const moves = new Map();
@@ -193,6 +195,11 @@ function migrateLegacy(rows) {
     assert.ok(!destinations.has(key), '多个旧文件映射到同一迁移目标，原文件已保留：' + to);
     destinations.add(key);
   }
+  if (commit) commitMigration(moves);
+  return moves;
+}
+
+function commitMigration(moves) {
   for (const [from, to] of moves) {
     fs.mkdirSync(path.dirname(to), { recursive: true });
     fs.renameSync(from, to);
@@ -224,19 +231,24 @@ function claimTargets(migrate = true) {
 }
 
 // 目录里出现无法对应当前协议的文件就报错，防止删除/重命名条目后悄悄失效。
-function claimedItems(paused = false) {
-  const rows = claimTargets();
+function claimedItems(paused = false, rows = claimTargets(), moves = new Map()) {
+  const originals = new Map([...moves].map(([from, to]) => [to, from]));
   for (const kind of ['entry', 'card']) {
     const known = new Set(rows.filter((row) => row.kind === kind).map((row) => row.name));
     const dir = paused ? path.join(pausedDir, kind === 'card' ? '卡面' : '条目')
       : kind === 'card' ? cardDir : entryDir;
-    for (const name of layerFiles(dir, '', known)) {
+    const legacyNames = new Set([...known, ...rows.filter((row) => row.kind === kind)
+      .map((row) => row.legacyName).filter(Boolean)]);
+    for (const oldName of layerFiles(dir, '', legacyNames)) {
+      const oldFile = path.join(dir, oldName);
+      const name = path.relative(dir, moves.get(oldFile) ?? oldFile).split(path.sep).join('/');
       assert.ok(known.has(name), path.relative(root, dir) + '/' + name
         + ' 在当前清单里找不到对应身份。请恢复清单或备份并迁移这个文件。');
     }
   }
   return rows.filter((row) => {
-    const file = paused ? pausedFile(row) : row.mine;
+    const target = paused ? pausedFile(row) : row.mine;
+    const file = originals.get(target) ?? target;
     if (!fs.existsSync(file)) return false;
     assert.ok(fs.lstatSync(file).isFile(), '认领项必须是普通文件：' + file);
     return true;
@@ -248,8 +260,13 @@ export function applyAuthorLayer(worldbook, options) {
   return adapter.applyEntries(worldbook, claimedItems().filter((item) => item.kind === 'entry'), options);
 }
 
-export function applyAuthorCardFields(card) {
-  return adapter.applyCard(card, claimedItems().filter((item) => item.kind === 'card'));
+export function applyAuthorCardFields(card, options) {
+  return adapter.applyCard(card, claimedItems().filter((item) => item.kind === 'card'), options);
+}
+
+// 在 forge 读取开场源文本后、注入 initvar/状态栏占位符前调用；保留原 state 路径。
+export function resolveAuthorFirstMessage(index, aiSourceText) {
+  return adapter.resolveFirstMessage(index, aiSourceText, claimedItems().filter((item) => item.kind === 'card'));
 }
 
 // 逐行找出 other 相对 base 的替换块。条目最多几十行，直接算最长公共子序列。
@@ -418,35 +435,42 @@ function commandClaim(keyword) {
 }
 
 function commandSync() {
-  const items = claimedItems();
-  if (items.length === 0) {
-    console.log('你还没有认领任何东西。');
-    return;
-  }
+  const rows = claimTargets(false);
+  const moves = migrateLegacy(rows, false);
+  const originals = new Map([...moves].map(([from, to]) => [to, from]));
+  const items = claimedItems(false, rows, moves);
+  const writes = [];
+  const notes = [];
   const toOpen = [];
   for (const item of items) {
-    const mineText = readText(item.mine);
+    const mineText = readText(originals.get(item.mine) ?? item.mine);
     const aiText = item.aiText();
-    if (!fs.existsSync(item.snapshot)) {
-      writeText(item.snapshot, aiText);
-      console.log(`· ${item.label}：开始记录 AI 当前版本，下次同步起生效。`);
+    const snapshot = originals.get(item.snapshot) ?? item.snapshot;
+    if (!fs.existsSync(snapshot)) {
+      writes.push([item.snapshot, aiText]);
+      notes.push(`· ${item.label}：开始记录 AI 当前版本，下次同步起生效。`);
       continue;
     }
-    const snapshotText = readText(item.snapshot);
+    const snapshotText = readText(snapshot);
     if (snapshotText === aiText) {
-      console.log(`· ${item.label}：AI 没有改动。`);
+      notes.push(`· ${item.label}：AI 没有改动。`);
       continue;
     }
     const merged = mergeThree(snapshotText.split('\n'), mineText.split('\n'), aiText.split('\n'));
-    writeText(item.mine, merged.lines.join('\n'));
-    writeText(item.snapshot, aiText);
+    writes.push([item.mine, merged.lines.join('\n')], [item.snapshot, aiText]);
     if (merged.conflicts > 0) toOpen.push(item.mine);
-    console.log(
+    notes.push(
       merged.conflicts === 0
         ? `· ${item.label}：AI 的新改动已并进你的文件。`
         : `· ${item.label}：有 ${merged.conflicts} 处双方都改到同一段，已在你的文件里用 ${conflictStart} / ${conflictMiddle} / ${conflictEnd} 标出，两份都留着，改完删掉这三行标记即可。`,
     );
   }
+  // 所有 adapter/config/template 读取与合并成功后，才执行迁移和写入。
+  ensureGitIgnore();
+  commitMigration(moves);
+  for (const [file, value] of writes) writeText(file, value);
+  if (items.length === 0) notes.push('你还没有认领任何东西。');
+  for (const note of notes) console.log(note);
   for (const file of toOpen) console.log(`打开：${file}`);
 }
 

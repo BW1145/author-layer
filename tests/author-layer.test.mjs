@@ -296,7 +296,7 @@ test('contents fragments are joined like forge and fragment-only leaves are excl
   assert.equal(book.entries[0].content, p.read(file));
 });
 
-test('multiple inline/file openings sync by state index and override both greeting fields', async (t) => {
+test('multiple inline/file openings sync by state index and resolve before pack', async (t) => {
   const p = project(t, {});
   const state = JSON.parse(p.read('tavern-cards-state.json'));
   state.first_messages = ['opening.md', 'alternate.json', '内联\n第三段'];
@@ -317,21 +317,175 @@ test('multiple inline/file openings sync by state index and override both greeti
   p.write(primary, '作者第一段'); p.write(alternate, '作者第二段');
   const api = await import(pathToFileURL(path.join(p.root, 'tools/author-layer.mjs')));
   const card = { first_mes: 'AI', data: { first_mes: 'AI', alternate_greetings: ['AI2', 'AI3', '保留其他项'] } };
-  assert.equal(api.applyAuthorCardFields(card), 3);
-  assert.equal(card.first_mes, '作者第一段');
-  assert.equal(card.data.first_mes, '作者第一段');
-  assert.deepEqual(card.data.alternate_greetings, ['作者第二段', '内联\n第三段新版', '保留其他项']);
+  const before = structuredClone(card);
+  assert.throws(() => api.applyAuthorCardFields(card), /resolveAuthorFirstMessage/);
+  assert.deepEqual(card, before);
+  assert.equal(api.resolveAuthorFirstMessage(0, 'AI'), '作者第一段');
+  assert.equal(api.resolveAuthorFirstMessage(1, 'AI2'), '作者第二段');
+  assert.equal(api.resolveAuthorFirstMessage(2, 'AI3'), '内联\n第三段新版');
+  assert.equal(api.resolveAuthorFirstMessage(3, '保留其他项'), '保留其他项');
+  assert.equal(api.applyAuthorCardFields(card, { skipOpenings: true }), 0);
+  assert.deepEqual(card, before);
   p.ok('pause');
   const untouched = structuredClone(card);
   assert.equal(api.applyAuthorCardFields(card), 0);
+  assert.equal(api.resolveAuthorFirstMessage(0, 'AI'), 'AI');
+  assert.equal(api.resolveAuthorFirstMessage(1, 'AI2'), 'AI2');
   assert.deepEqual(card, untouched);
   p.ok('resume');
   p.ok('release', 'first_messages[1]');
+  assert.equal(api.resolveAuthorFirstMessage(1, 'AI2'), 'AI2');
   assert.equal(p.ok('count').stdout.trim(), '2');
   state.first_messages = ['opening.md'];
   p.write('tavern-cards-state.json', state);
   assert.match(p.run('sync').stderr, /开场白.*2.txt.*找不到对应身份/);
   assert.equal(p.read(third), '内联\n第三段新版');
+});
+
+test('MVU source resolution preserves primary/alternate forge postprocessing and rejects late overrides', async (t) => {
+  const p = project(t, {});
+  const state = JSON.parse(p.read('tavern-cards-state.json'));
+  state.mvu = true;
+  state.first_messages = ['greetings/0.txt', 'greetings/1.txt', 'greetings/2.md'];
+  state.initvar_overrides = {
+    'greetings/0.txt': 'initvar/0.yaml', 'greetings/1.txt': 'initvar/1.yaml', 'greetings/2.md': 'initvar/2.yaml',
+  };
+  p.write('tavern-cards-state.json', state);
+  const original = '<div>\n<p>原叙事</p>\n<script>const version = 1;</script>\n<%= name %> {{user}}\n</div>';
+  for (let i = 0; i < 3; i += 1) {
+    p.write(state.first_messages[i], original);
+    p.write(`initvar/${i}.yaml`, `route: ${i}`);
+  }
+  const primary = p.claim('first_messages[0]');
+  const alternate = p.claim('first_messages[1]');
+  p.claim('名称.txt');
+  for (const file of [primary, alternate]) p.write(file, original.replace('原叙事', '作者叙事'));
+  for (const file of state.first_messages.slice(0, 2)) p.write(file, original.replace('version = 1', 'version = 2'));
+  p.ok('sync');
+  const merged = original.replace('原叙事', '作者叙事').replace('version = 1', 'version = 2');
+  assert.equal(p.read(primary), merged);
+  assert.equal(p.read(alternate), merged);
+  const api = await import(pathToFileURL(path.join(p.root, 'tools/author-layer.mjs')));
+  // Equivalent fixture for forge resolvePackState: source -> initvar -> .txt placeholder.
+  // Keep the original greeting key for both the override lookup and extension check.
+  const packed = state.first_messages.map((greetingKey, index) => {
+    let resolved = api.resolveAuthorFirstMessage(index, p.read(greetingKey));
+    const override = p.read(state.initvar_overrides[greetingKey]);
+    resolved += `\n\n<UpdateVariable>\n<initvar>\n${override}\n</initvar>\n</UpdateVariable>`;
+    if (state.mvu && path.extname(greetingKey) === '.txt') resolved += '\n\n<StatusPlaceHolderImpl/>';
+    return resolved;
+  });
+  assert.deepEqual(state.first_messages, ['greetings/0.txt', 'greetings/1.txt', 'greetings/2.md']);
+  for (let i = 0; i < 2; i += 1) {
+    assert.ok(packed[i].startsWith(merged));
+    assert.ok(packed[i].includes(`<initvar>\nroute: ${i}\n</initvar>`));
+    assert.ok(packed[i].endsWith('<StatusPlaceHolderImpl/>'));
+    assert.doesNotMatch(p.read([primary, alternate][i]), /UpdateVariable|StatusPlaceHolderImpl/);
+  }
+  assert.ok(packed[2].startsWith(original));
+  assert.ok(packed[2].includes('route: 2'));
+  assert.doesNotMatch(packed[2], /StatusPlaceHolderImpl/);
+  const card = {
+    name: 'AI', first_mes: packed[0], alternate_greetings: packed.slice(1),
+    data: { name: 'AI', first_mes: packed[0], alternate_greetings: packed.slice(1) },
+  };
+  const before = structuredClone(card);
+  assert.throws(() => api.applyAuthorCardFields(card), /resolveAuthorFirstMessage.*skipOpenings/);
+  assert.deepEqual(card, before); // Even the earlier name field remains untouched on error.
+  assert.equal(api.applyAuthorCardFields(card, { skipOpenings: true }), 1);
+  assert.equal(card.name, '项目名称');
+  assert.equal(card.data.name, '项目名称');
+  assert.equal(card.first_mes, packed[0]);
+  assert.equal(card.data.first_mes, packed[0]);
+  assert.deepEqual(card.alternate_greetings, packed.slice(1));
+  assert.deepEqual(card.data.alternate_greetings, packed.slice(1));
+  p.ok('release', 'first_messages[0]');
+  const alternateOnly = structuredClone(card);
+  assert.throws(() => api.applyAuthorCardFields(card), /resolveAuthorFirstMessage/);
+  assert.deepEqual(card, alternateOnly);
+});
+
+test('template-compat sync validates every item before writing text or existing/missing snapshots', (t) => {
+  const failures = [
+    { config: null, pattern: /找不到文件：.*card-build.config.json/ },
+    { config: '{', pattern: /card-build.config.json 不是合法 JSON/ },
+    ...[{}, { inputs: {} }, { inputs: { cardTemplate: '' } }, { inputs: { cardTemplate: 12 } }]
+      .map((config) => ({ config, pattern: /缺少有效的 inputs.cardTemplate/ })),
+    { template: null, pattern: /找不到文件：.*card.json/ },
+    { template: '{', pattern: /card.json 不是合法 JSON/ },
+    ...[{}, { data: null }, { data: [] }, { data: 'bad' }]
+      .map((template) => ({ template, pattern: /缺少有效的 data 对象/ })),
+    { adapter: 'unknown', pattern: /未知 adapter/ },
+  ];
+  for (const failure of failures) {
+    const config = { adapter: 'template-compat', cardFields: [
+      { key: 'name', file: 'name.txt' }, { key: 'description', file: 'description.txt' },
+      { key: 'personality', file: 'personality.txt' },
+    ] };
+    const p = project(t, config);
+    p.write('card-build.config.json', { inputs: { cardTemplate: 'templates/card.json' } });
+    p.write('templates/card.json', { data: { personality: '原性格' } });
+    const files = ['name.txt', 'description.txt', 'personality.txt'].map((name) => p.claim(name));
+    p.write(files[1], '作者描述');
+    const state = JSON.parse(p.read('tavern-cards-state.json'));
+    state.projectName = 'AI 新名称'; state.description = 'AI 新描述';
+    p.write('tavern-cards-state.json', state);
+    const missingSnapshot = path.join(p.root, '作者层/快照/卡面-name.txt');
+    fs.unlinkSync(missingSnapshot);
+    const watched = [...files, '作者层/快照/卡面-description.txt', '作者层/快照/卡面-personality.txt', '.gitignore'];
+    p.write('.gitignore', '# existing ignore rules\n');
+    const before = watched.map((file) => fs.readFileSync(path.join(p.root, file)));
+    if (Object.hasOwn(failure, 'config')) {
+      if (failure.config === null) fs.unlinkSync(path.join(p.root, 'card-build.config.json'));
+      else p.write('card-build.config.json', failure.config);
+    }
+    if (Object.hasOwn(failure, 'template')) {
+      if (failure.template === null) fs.unlinkSync(path.join(p.root, 'templates/card.json'));
+      else p.write('templates/card.json', failure.template);
+    }
+    if (failure.adapter) p.write('author-layer.config.json', { ...config, adapter: failure.adapter });
+    const result = p.run('sync');
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, failure.pattern);
+    assert.equal(result.stdout, '');
+    watched.forEach((file, i) => assert.deepEqual(fs.readFileSync(path.join(p.root, file)), before[i], file));
+    assert.equal(fs.existsSync(missingSnapshot), false);
+    // After fixing the error, the same two-phase sync still writes and reports all items.
+    p.write('author-layer.config.json', config);
+    p.write('card-build.config.json', { inputs: { cardTemplate: 'templates/card.json' } });
+    p.write('templates/card.json', { data: { personality: '原性格' } });
+    const success = p.ok('sync');
+    assert.match(success.stdout, /开始记录 AI 当前版本/);
+    assert.match(success.stdout, /双方都改到同一段/);
+    assert.match(success.stdout, /AI 没有改动/);
+    assert.equal(p.read('作者层/快照/卡面-name.txt'), 'AI 新名称');
+    assert.equal(p.read('作者层/快照/卡面-description.txt'), 'AI 新描述');
+    assert.equal(p.read(files[0]), '项目名称');
+    assert.equal(p.read(files[1]), conflict(['作者描述'], ['AI 新描述']).join('\n'));
+  }
+});
+
+test('sync defers legacy text/snapshot migration until all template reads succeed', (t) => {
+  const p = project(t, { adapter: 'template-compat', cardFields: [{ key: 'personality', file: 'personality.md' }] });
+  p.write('card-build.config.json', { inputs: { cardTemplate: 'templates/card.json' } });
+  p.write('templates/card.json', { data: { personality: '原性格' } });
+  const personality = p.claim('personality.md');
+  p.write('作者层/条目/story.md', '作者头\na\nb');
+  p.write('作者层/快照/story.md', 'head\na\nb');
+  p.write('world/story.md', 'head\na\nAI尾');
+  const name = p.entryName();
+  const watched = [personality, '作者层/快照/卡面-personality.md', '作者层/条目/story.md', '作者层/快照/story.md'];
+  const before = watched.map((file) => fs.readFileSync(path.join(p.root, file)));
+  p.write('templates/card.json', '{');
+  assert.match(p.run('sync').stderr, /card.json 不是合法 JSON/);
+  watched.forEach((file, i) => assert.deepEqual(fs.readFileSync(path.join(p.root, file)), before[i], file));
+  assert.equal(fs.existsSync(path.join(p.root, `作者层/条目/${name}`)), false);
+  assert.equal(fs.existsSync(path.join(p.root, `作者层/快照/条目/${name}`)), false);
+  p.write('templates/card.json', { data: { personality: '新性格' } });
+  assert.match(p.ok('sync').stderr, /已迁移作者层路径/);
+  assert.equal(p.read(personality), '新性格');
+  assert.equal(p.read(`作者层/条目/${name}`), '作者头\na\nAI尾');
+  assert.equal(p.read(`作者层/快照/条目/${name}`), 'head\na\nAI尾');
 });
 
 test('same-position insertions conflict at the start, middle, end and empty baseline', async (t) => {

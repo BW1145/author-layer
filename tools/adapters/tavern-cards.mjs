@@ -116,31 +116,30 @@ export function createAdapter({ root, config, readText, readJson }, readCardFiel
     return assignments.length;
   }
 
-  function applyCard(card, items) {
+  function resolveFirstMessage(index, aiSourceText, items) {
+    const item = items.find((row) => row.id === `first_messages[${index}]`);
+    return item ? readText(item.mine) : aiSourceText;
+  }
+
+  function applyCard(card, items, { skipOpenings = false } = {}) {
     assert.ok(card?.data && typeof card.data === 'object' && !Array.isArray(card.data), '成品卡缺少 data 对象。');
+    assert.ok(skipOpenings || items.every((item) => item.key !== 'first_mes' && item.key !== 'alternate_greetings'),
+      '已认领开场白必须在 forge pack 后处理前通过 resolveAuthorFirstMessage(index, aiSourceText) 读取；'
+      + '完成接入后，请用 applyAuthorCardFields(card, { skipOpenings: true }) 覆盖其余卡面字段。');
+    items = items.filter((item) => item.key !== 'first_mes' && item.key !== 'alternate_greetings');
     const assignments = items.map((item) => {
       const value = readText(item.mine);
-      if (item.key === 'alternate_greetings') {
-        assert.ok(Array.isArray(card.data.alternate_greetings)
-          && item.index - 1 < card.data.alternate_greetings.length,
-        `${item.label} 不在成品 alternate_greetings 中，请先按当前 state 构建全部开场白。`);
-      }
       return { item, value };
     });
     for (const { item, value } of assignments) {
-      if (item.key === 'alternate_greetings') {
-        card.data.alternate_greetings[item.index - 1] = value;
-        if (Array.isArray(card.alternate_greetings)) card.alternate_greetings[item.index - 1] = value;
-      } else {
-        card.data[item.key] = value;
-        if (item.key in card) card[item.key] = value;
-      }
+      card.data[item.key] = value;
+      if (item.key in card) card[item.key] = value;
     }
     return items.length;
   }
 
   return {
-    discover, applyEntries, applyCard,
+    discover, applyEntries, applyCard, resolveFirstMessage,
     note: () => fs.existsSync(statePath) ? '' : `提示：根目录没有 ${config.stateFile}，清单按空处理，可认领项只有卡面字段。`,
   };
 }

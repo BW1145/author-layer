@@ -1,6 +1,6 @@
 # 角色卡作者层工具
 
-把一张卡里「你自己写的内容」和「AI 维护的内容」分开。你认领的部分放在 `作者层/` 下，封装时盖回对应世界书条目和卡面字段；AI 改动原稿之后，可以把它并进你的文件。
+把一张卡里「你自己写的内容」和「AI 维护的内容」分开。你认领的部分放在 `作者层/` 下，封装时用于对应世界书条目、卡面字段和开场源文本；AI 改动原稿之后，可以把它并进你的文件。
 
 默认支持 TavernWeave 使用的 ai4rpg/tavern-cards state 协议。核心管理作者文件、快照、三路合并、认领、同步、停用恢复和 Git 隐私保护；`tools/adapters/tavern-cards.mjs` 负责发现条目、读取底稿和覆盖成品。只使用 Node 内置模块，无需安装依赖。adapter 由配置明确选择。
 
@@ -56,7 +56,9 @@ author-layer.config.json     （可选）
 
 世界书 leaf 支持 `path` 和有序 `contents`；`contents` 中的 `file` 读取文件，`content` 使用内联文本，片段以换行连接。与 forge 一致，已被组合正文引用的片段 leaf 不单独列为认领项，应认领输出的组合条目。
 
-开场白支持内联文本和文件路径。与上游一致，单行且以 `.txt/.md/.json/.yaml/.yml/.html` 结尾、对应文件已存在时读取文件，否则作为正文。每个数组位置独立认领和同步，覆盖成品时保留其他未认领开场白。认领的是**数组位置**：重排 state 数组后，文件仍属于原编号，会与该位置的新正文同步；请按需要先取消认领再重新认领。删除仍被认领的备用位置会报错并保留作者文件。配置保留 `first_mes` 时会自动列出全部备用开场白。
+开场白支持内联文本和文件路径。与上游一致，单行且以 `.txt/.md/.json/.yaml/.yml/.html` 结尾、对应文件已存在时读取文件，否则作为正文。每个数组位置独立认领和同步，封装前解析源文本时保留其他未认领开场白。认领的是**数组位置**：重排 state 数组后，文件仍属于原编号，会与该位置的新正文同步；请按需要先取消认领再重新认领。删除仍被认领的备用位置会报错并保留作者文件。配置保留 `first_mes` 时会自动列出全部备用开场白。
+
+author-layer 不解析或保护 HTML、EJS、宏和脚本结构；认领的是整个源文件，用户负责只修改想接管的部分。三路合并后的开场源文本在 pack 前生效，tavern-cards 的 forge 仍负责最终开场的 initvar、`<StatusPlaceHolderImpl/>` 等后处理。
 
 `author-layer.config.json` 全部可省略：
 
@@ -114,14 +116,27 @@ author-layer.config.json     （可选）
 
 ## 封装器接入
 
-封装器在成品对象构建完成、写出 JSON 或嵌入 PNG 前调用导出函数；forge 本身需要这一调用接入作者层。
+默认 tavern-cards 路径需要在 forge 内接入开场源文本解析。用户先用 `sync` 合并 AI 新改动、处理冲突；封装时，在 forge 的 `resolvePackState` 中读取开场源文本后、执行 initvar 和状态栏后处理前调用：
+
+```js
+import { resolveAuthorFirstMessage } from './tools/author-layer.mjs';
+
+// 在 state.first_messages.map((item, index) => { ... }) 内：
+const greetingKey = state.first_messages[index];
+let resolved = resolveAuthorFirstMessage(index, resolveInlineOrFile(item, stateDir));
+// 后续继续执行 forge 原有的 initvar 注入和状态栏占位符处理。
+```
+
+`resolveAuthorFirstMessage(index, aiSourceText)` 返回已认领位置的完整源文本；未认领或停用时原样返回 `aiSourceText`。它只读取当前作者版本，不执行同步。保留原 `state.first_messages` 路径及 `greetingKey`，使 forge 继续按原扩展名和 `initvar_overrides` 路径映射执行后处理；不要把 state 路径数组改成作者内联文本。该接口需要封装器显式调用。
+
+世界书和其余卡面字段在成品对象构建完成、写出 JSON 或嵌入 PNG 前调用：
 
 ```js
 import { applyAuthorLayer, applyAuthorCardFields } from './tools/author-layer.mjs';
 
 applyAuthorLayer(worldbook);                  // 独立世界书
 applyAuthorLayer(card.data.character_book);   // 卡内世界书，若单独构建
-applyAuthorCardFields(card);                  // 卡面及多个开场白
+applyAuthorCardFields(card, { skipOpenings: true }); // 已接入开场源解析，覆盖其余卡面
 ```
 
 两个函数都返回覆盖项数。`applyAuthorLayer` 支持对象或数组形式的 `entries`；默认用上游输出的 `comment` 对应 manifest 条目名，并要求名称在 manifest 和成品中都唯一。成品里有同名条目时，封装器保留创建时的 manifest 身份，传入一份显式映射：
@@ -135,13 +150,17 @@ applyAuthorLayer(worldbook, {
 });
 ```
 
-映射键是 `worldbook.entries` 中的键，数组形式则是下标；值为 `[类型, 条目名称]`。同名条目的映射由构建器创建条目时记录，不能靠成品的顺序或正文反推。缺少唯一对应关系时中止覆盖。成品里的 `alternate_greetings` 需先由构建器按当前 state 生成，再由作者层逐位置覆盖。
+映射键是 `worldbook.entries` 中的键，数组形式则是下标；值为 `[类型, 条目名称]`。同名条目的映射由构建器创建条目时记录，不能靠成品的顺序或正文反推。缺少唯一对应关系时中止覆盖。
 
-轻量 adapter 接口是 `defaults` 和 `createAdapter({ root, config, readText, readJson })`。返回的 `discover()` 提供身份、相对作者文件名、菜单名称、`aiText()` 底稿读取函数及可选旧文件名；`applyEntries()` / `applyCard()` 接收核心确认的认领项，处理成品映射；`note()` 提供缺少 state 等状态提示。增加其他协议时实现这个边界并在核心的选择表注册即可，文件生命周期与合并算法继续复用。
+`applyAuthorCardFields(card)` 保留原用法：没有认领开场时继续覆盖其余卡面；有认领开场时，在修改任何成品字段前报错并提示接入源解析。完成 pre-pack 接入后显式传入 `{ skipOpenings: true }`，只覆盖其余卡面，保留 forge 生成的 `first_mes` 与 `alternate_greetings`。该约定也适用于 `template-compat`。
+
+轻量 adapter 接口是 `defaults` 和 `createAdapter({ root, config, readText, readJson })`。返回的 `discover()` 提供身份、相对作者文件名、菜单名称、`aiText()` 底稿读取函数及可选旧文件名；`resolveFirstMessage(index, aiSourceText, items)` 解析开场源文本；`applyEntries()` / `applyCard()` 接收核心确认的认领项，处理成品映射；`note()` 提供缺少 state 等状态提示。增加其他协议时实现这个边界并在核心的选择表注册即可，文件生命周期与合并算法继续复用。
 
 ## 三路合并
 
 认领时保存 AI 当时的正文作为快照。`sync` 使用快照、作者当前正文和 AI 当前正文做逐行三路合并：不同位置的改动自动合并；重叠修改或同一基线位置的双方插入生成冲突标记，保留两份内容：
+
+同步先读取、校验并计算全部认领项，全部成功后才统一执行路径迁移、正文和快照写入。adapter、配置或模板错误会中止本次同步，保留原正文与快照；逐项提示在成功写入后输出。
 
 文件中的标记依次为 `<<<<<<< 我的写法`、`=======`、`>>>>>>> AI新改`，中间分别保留作者内容和 AI 内容。
 
