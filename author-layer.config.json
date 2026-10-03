@@ -1,7 +1,7 @@
 {
   "layerDir": "作者层",
+  "adapter": "tavern-cards",
   "stateFile": "tavern-cards-state.json",
-  "cardConfigFile": "card-build.config.json",
   "ruleFiles": [
     "AGENTS.md",
     "CLAUDE.md"

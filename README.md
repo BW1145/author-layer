@@ -1,87 +1,174 @@
 # 角色卡作者层工具
 
-把一张卡里「你自己写的内容」和「AI 维护的内容」分开。你认领的部分放在 `作者层/` 下，封装时自动盖回清单条目和卡面字段；AI 改动原稿之后，再把它并进你的文件。
+把一张卡里「你自己写的内容」和「AI 维护的内容」分开。你认领的部分放在 `作者层/` 下，封装时用于对应世界书条目、卡面字段和开场源文本；AI 改动原稿之后，可以把它并进你的文件。
 
-工具本身不知道自己在哪个盘、哪个目录：项目根由 `tools/author-layer.mjs` 的位置反推（`tools/` 的上一层），目录名、文件名、卡面字段全部由项目根下的 `author-layer.config.json` 决定，不写就用内置默认值。只用 Node 内置模块，没有 `node_modules`，也不需要联网。
+默认支持 TavernWeave 使用的 ai4rpg/tavern-cards state 协议。核心管理作者文件、快照、三路合并、认领、同步、停用恢复和 Git 隐私保护；`tools/adapters/tavern-cards.mjs` 负责发现条目、读取底稿和覆盖成品。只使用 Node 内置模块，无需安装依赖。adapter 由配置明确选择。
 
-## 装到别的工作区
+## 装到角色卡工作区
 
-把下面四项复制进目标项目根目录就行了：
+把下面这些文件复制到项目根目录，保留 `tools/` 内的目录结构：
 
-```
+```text
 我的改动.cmd
 我的改动.ps1
-tools/author-layer.mjs
-author-layer.config.json     （可选；不放就用内置默认值）
+tools/
+  author-layer.mjs
+  adapters/
+    tavern-cards.mjs
+    template-compat.mjs
+author-layer.config.json     （可选）
 ```
 
-前提是机器上有 `node`（`node --version` 能跑通）。装好后双击 `我的改动.cmd` 打开菜单。目标项目里原有的 `AGENTS.md` 会被补上作者层规则段，没有就新建一个；`CLAUDE.md` 只在它本来就存在时才同步。工具每次运行或被封装器导入时，也会确保 `.gitignore` 包含当前 `layerDir` 的忽略规则；更新时提示写到 stderr，`count`、`layer` 的 stdout 格式保持原样。
+需要支持 `import.meta.dirname` / `import.meta.filename` 的 Node.js（Node 22 或更新版本）。项目根由 `tools/author-layer.mjs` 所在目录的上一层确定。
 
-## 目录约定
+双击 `我的改动.cmd` 打开菜单。启动器会补充项目的作者层规则：`AGENTS.md` 不存在时创建，`CLAUDE.md` 已存在时同步。工具运行或被封装器导入时，会确保 `.gitignore` 保护当前 `layerDir`；提示写入 stderr，`count`、`layer` 的 stdout 格式供启动器继续使用。
 
-工具会在项目根下维护这些位置（名字可在配置里改）：
+## 目录与身份
+
+世界书条目的身份是 manifest 中的 **类型 + 条目名称**。完整源路径也可以用于命令选择，例如 `claim 世界书/NPC/基础信息.yaml`。两个不同目录里的 `基础信息.yaml` 可以分别认领；仅输入这个共同文件名时，菜单会列出候选供你缩小关键词。
 
 | 位置 | 作用 |
 | --- | --- |
-| `作者层/条目/` | 你认领的世界书条目，文件名与清单里的源文件同名 |
-| `作者层/卡面/` | 你认领的卡面字段，如 `名称.txt`、`描述.txt` |
-| `作者层/快照/` | 记录上一次同步时 AI 那一份的样子，用来算三路合并 |
-| `作者层/停用/` | 临时挪出去的内容，这次封装不带 |
-| `作者层/已取消/` | 取消认领后留档的正文 |
+| `作者层/条目/<类型编码>/<条目名编码>.<原扩展名>` | 认领的世界书正文；组合正文使用 `.txt` |
+| `作者层/卡面/` | 配置的卡面字段，如 `名称.txt`、`开场白.txt` |
+| `作者层/卡面/开场白/1.txt`、`2.txt`… | 第 1、2…个备用开场白 |
+| `作者层/快照/条目/<类型编码>/<条目名编码>.<扩展名>` | 上次同步的 AI 条目底稿 |
+| `作者层/快照/卡面-<字段文件>` | 上次同步的 AI 卡面底稿，沿用已有卡面快照路径 |
+| `作者层/停用/条目/`、`停用/卡面/` | 暂时停用的认领文件，保留相同相对路径 |
+| `作者层/已取消/条目/`、`已取消/卡面/` | 取消认领后留档的正文 |
 
-## 配置项
+类型和条目名编码保留可读前缀，转义 Windows 非法字符，并附加 12 位 SHA-256 摘要，区分大小写、保留名和编码后重名。路径碰撞会报错。`list` 显示实际作者文件路径。修改源路径但保持类型、条目名与扩展名不变时，认领身份和存储位置保持不变；更改身份或扩展名时需迁移已有作者文件和快照。
+
+## state 契约与配置
+
+默认 adapter 的底稿来源是 `tavern-cards-state.json`：
+
+| state 字段 | 成品字段 / 作者文件 |
+| --- | --- |
+| `projectName` | `name` / `名称.txt` |
+| `description` | `description` / `描述.txt` |
+| `personality` | `personality` / `性格.txt` |
+| `scenario` | `scenario` / `场景.txt` |
+| `mes_example` | `mes_example` / `对话示例.txt` |
+| `first_messages[0]` | `first_mes` / `开场白.txt` |
+| `first_messages[i]`，`i >= 1` | `alternate_greetings[i - 1]` / `开场白/i.txt` |
+| `entryManifest[类型][条目名称]` | 世界书条目正文 |
+
+世界书 leaf 支持 `path` 和有序 `contents`；`contents` 中的 `file` 读取文件，`content` 使用内联文本，片段以换行连接。与 forge 一致，已被组合正文引用的片段 leaf 不单独列为认领项，应认领输出的组合条目。
+
+开场白支持内联文本和文件路径。与上游一致，单行且以 `.txt/.md/.json/.yaml/.yml/.html` 结尾、对应文件已存在时读取文件，否则作为正文。每个数组位置独立认领和同步，封装前解析源文本时保留其他未认领开场白。认领的是**数组位置**：重排 state 数组后，文件仍属于原编号，会与该位置的新正文同步；请按需要先取消认领再重新认领。删除仍被认领的备用位置会报错并保留作者文件。配置保留 `first_mes` 时会自动列出全部备用开场白。
+
+author-layer 不解析或保护 HTML、EJS、宏和脚本结构；认领的是整个源文件，用户负责只修改想接管的部分。三路合并后的开场源文本在 pack 前生效，tavern-cards 的 forge 仍负责最终开场的 initvar、`<StatusPlaceHolderImpl/>` 等后处理。
 
 `author-layer.config.json` 全部可省略：
 
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
-| `layerDir` | `作者层` | 存放你自己内容的项目内子目录，也支持嵌套目录；同步写入 `.gitignore` 管理段 |
-| `stateFile` | `tavern-cards-state.json` | 清单文件；不在时按空清单运行 |
-| `cardConfigFile` | `card-build.config.json` | 从这里读 `inputs.cardTemplate` 拿卡面底稿 |
-| `ruleFiles` | `["AGENTS.md", "CLAUDE.md"]` | 写入作者层规则的文件；第一个不存在会创建，其余只在已存在时同步 |
-| `cardFields` | 名称、描述、性格、场景、开场白、对话示例 | 可认领的卡面字段，每项写 `key`、`file`（文件名）、`label`（菜单里的名字） |
-| `ruleMarkdown` | 内置那段 | 整段替换写进规则文件的正文（两行标记由工具自己加） |
+| `adapter` | `tavern-cards` | 协议选择；另有显式模板兼容路径 `template-compat` |
+| `layerDir` | `作者层` | 项目内子目录，可嵌套；同步写入 Git 忽略规则 |
+| `stateFile` | `tavern-cards-state.json` | 不存在时使用空清单、空卡面底稿；错误 JSON 会报出文件路径 |
+| `ruleFiles` | `["AGENTS.md", "CLAUDE.md"]` | 第一个不存在时创建，其余仅在已存在时同步 |
+| `cardFields` | 名称、描述、性格、场景、开场白、对话示例 | 每项有 `key`、`file`、`label`；可添加 `system_prompt` 等 state 文本字段；文件路径需在卡面目录内且互不碰撞 |
+| `ruleMarkdown` | 内置规则 | 替换规则正文，两行管理标记由工具加入 |
 
-清单文件（`stateFile`）用 `entryManifest` 分组列出条目，每条带 `path`（源文件路径）和 `uid`。`projectName` 和 `description` 就是名称、描述的底稿；`first_messages` 是开场白源文件路径的列表，取第一个当开场白底稿。`性格`、`场景`、`对话示例` 三个字段的底稿来自卡面模板里的 `data`。
+模板兼容项目可以显式设置：
 
-配置的 `cardFields` 若只包含 `name`、`description`、`first_mes`，或为空，只需 state；包含其他字段时，需要合法的 `cardConfigFile`、`inputs.cardTemplate` 路径和带 `data` 对象的模板 JSON。缺失文件或格式错误会显示具体路径与原因，并中止操作。
+```json
+{
+  "adapter": "template-compat",
+  "cardConfigFile": "card-build.config.json"
+}
+```
+
+该路径的名称、描述和开场白仍来自 state，其余卡面字段从 `inputs.cardTemplate` 指定模板的 `data` 读取。缺少配置、模板路径、有效 `data` 或错误 JSON 都会明确报错。默认 `tavern-cards` 使用 state 卡面文本字段。
+
+## 旧作者层数据迁移
+
+升级时先备份整个作者层目录，包括快照和停用目录，并复制完整新版 `tools/`。
+
+工具在读取归属或执行认领、同步、封装等操作前，会检查旧的 basename 布局，例如 `作者层/条目/story.md` 与 `作者层/快照/story.md`。旧 basename 在当前 manifest 中唯一对应时，正文、停用正文与快照一起迁移到新身份路径。提示只包含路径，写到 stderr；卡面字段和已有卡面快照继续沿用。旧快照即使暂时没有正文，也会按相同规则检查和迁移。
+
+迁移前会检查所有旧文件的归属和目标。basename 对应多个条目、条目已移除、目标已有文件或旧快照与卡面快照重名时，操作中止，保留原文件，显示原因与候选路径。处理方法：
+
+1. 运行 `node tools/author-layer.mjs list`，查看每个条目的类型、名称、源路径和作者路径。`list` 只展示映射，迁移受阻时也可使用。
+2. 确认旧正文属于哪个条目，把它移到显示的作者路径；停用文件放到 `作者层/停用/条目/` 下的相同相对路径。
+3. 把对应旧快照移到 `作者层/快照/条目/` 下的相同相对路径。快照保存的是此前 AI 底稿，迁移时保持其原有内容。
+4. 目标已有文件时，先在备份中保留两份并由你确定采用哪一份；归属无法确定的文件移入备份目录后再操作。重试 `status` 确认归属。
+
+当前作者目录中无法对应 manifest 的文件也会阻止同步或封装。未注册为认领项的编辑器点文件、`~` 临时文件不参与；命名子目录中的正文同样会检查。认领、停用、恢复和取消认领支持 `.md`、`.json`、`.yaml` 等扩展名，移动前检查全部目标并保留已有文件。
 
 ## 命令
 
-菜单里都有，也可以直接跑 `node tools/author-layer.mjs <命令>`：
+菜单操作保持原样，也可运行 `node tools/author-layer.mjs <命令>`：
 
 | 命令 | 作用 |
 | --- | --- |
-| `status` | 看归属与同步状态 |
-| `list [关键词]` | 列出全部可认领项与归属 |
-| `claim 关键词` | 认领一项，当前正文抄进 `作者层/` |
-| `sync` | 把 AI 的新改动并进你的文件 |
-| `mine` | 列出归你的项（编号、名字、路径） |
-| `toggle` / `pause` / `resume` | 停用或恢复你的全部内容 |
-| `release 关键词` | 取消认领，正文留档到 `作者层/已取消/` |
-| `count` | 只输出归你的项数 |
+| `status` | 查看归属与同步状态 |
+| `list [关键词]` | 列出可认领项、归属和作者路径 |
+| `claim 关键词` | 认领一项；完整源路径、完整菜单名称或 `first_messages[1]` 等身份优先精确匹配 |
+| `sync` | 把 AI 新改动并进作者文件 |
+| `mine` | 输出归你的项（编号、名称、绝对路径） |
+| `toggle` / `pause` / `resume` | 停用或恢复全部认领内容 |
+| `release 关键词` | 取消认领，正文留档 |
+| `count` | 只输出有效认领项数 |
 | `layer` | 输出作者层目录的绝对路径 |
-| `install-rule` | 在项目根写入/刷新作者层规则 |
+| `install-rule` | 写入或刷新项目作者层规则 |
 
-封装器侧可以 `import` 本模块的两个函数，把作者层盖进成品：
+## 封装器接入
+
+默认 tavern-cards 路径需要在 forge 内接入开场源文本解析。用户先用 `sync` 合并 AI 新改动、处理冲突；封装时，在 forge 的 `resolvePackState` 中读取开场源文本后、执行 initvar 和状态栏后处理前调用：
+
+```js
+import { resolveAuthorFirstMessage } from './tools/author-layer.mjs';
+
+// 在 state.first_messages.map((item, index) => { ... }) 内：
+const greetingKey = state.first_messages[index];
+let resolved = resolveAuthorFirstMessage(index, resolveInlineOrFile(item, stateDir));
+// 后续继续执行 forge 原有的 initvar 注入和状态栏占位符处理。
+```
+
+`resolveAuthorFirstMessage(index, aiSourceText)` 返回已认领位置的完整源文本；未认领或停用时原样返回 `aiSourceText`。它只读取当前作者版本，不执行同步。保留原 `state.first_messages` 路径及 `greetingKey`，使 forge 继续按原扩展名和 `initvar_overrides` 路径映射执行后处理；不要把 state 路径数组改成作者内联文本。该接口需要封装器显式调用。
+
+世界书和其余卡面字段在成品对象构建完成、写出 JSON 或嵌入 PNG 前调用：
 
 ```js
 import { applyAuthorLayer, applyAuthorCardFields } from './tools/author-layer.mjs';
+
+applyAuthorLayer(worldbook);                  // 独立世界书
+applyAuthorLayer(card.data.character_book);   // 卡内世界书，若单独构建
+applyAuthorCardFields(card, { skipOpenings: true }); // 已接入开场源解析，覆盖其余卡面
 ```
 
-`applyAuthorLayer(worldbook)` 按 `uid` 换掉条目正文，`applyAuthorCardFields(card)` 覆盖卡面字段，两个都返回合并了多少项。
+两个函数都返回覆盖项数。`applyAuthorLayer` 支持对象或数组形式的 `entries`；默认用上游输出的 `comment` 对应 manifest 条目名，并要求名称在 manifest 和成品中都唯一。成品里有同名条目时，封装器保留创建时的 manifest 身份，传入一份显式映射：
 
-## 同步是怎么合的
+```js
+applyAuthorLayer(worldbook, {
+  entryIdentities: {
+    0: ['角色', '基础信息'],
+    1: ['NPC', '基础信息'],
+  },
+});
+```
 
-认领时记一份 AI 当时的正文当底稿。之后 AI 改了原稿、你也改了自己的文件，`sync` 拿这三份做三路合并：两边改到不同位置自动并；只有改到同一段才在文件里插 `<<<<<<< 我的写法` / `=======` / `>>>>>>> AI新改` 三行标记，两份都留着，你改完删掉标记即可。多处传递重叠的修改会组成一个完整冲突段，保留双方修改及段内未改动的行。
+映射键是 `worldbook.entries` 中的键，数组形式则是下标；值为 `[类型, 条目名称]`。同名条目的映射由构建器创建条目时记录，不能靠成品的顺序或正文反推。缺少唯一对应关系时中止覆盖。
 
-## 注意
+`applyAuthorCardFields(card)` 保留原用法：没有认领开场时继续覆盖其余卡面；有认领开场时，在修改任何成品字段前报错并提示接入源解析。完成 pre-pack 接入后显式传入 `{ skipOpenings: true }`，只覆盖其余卡面，保留 forge 生成的 `first_mes` 与 `alternate_greetings`。该约定也适用于 `template-compat`。
 
-`作者层/` 里是私人内容。工具只按文件名对应关系读写，不做内容检查；`作者层/条目/` 或 `作者层/卡面/` 里出现清单里没有的名字时，会直接报错停下，避免悄悄失效。
+轻量 adapter 接口是 `defaults` 和 `createAdapter({ root, config, readText, readJson })`。返回的 `discover()` 提供身份、相对作者文件名、菜单名称、`aiText()` 底稿读取函数及可选旧文件名；`resolveFirstMessage(index, aiSourceText, items)` 解析开场源文本；`applyEntries()` / `applyCard()` 接收核心确认的认领项，处理成品映射；`note()` 提供缺少 state 等状态提示。增加其他协议时实现这个边界并在核心的选择表注册即可，文件生命周期与合并算法继续复用。
 
-认领、停用和恢复以清单条目及配置的卡面字段为准，支持 `.md`、`.json` 等扩展名。移动前会验证认领文件与全部目标路径，目标有同名文件就报错，保留现有文件；编辑器临时文件和无关子目录不参与移动。
+## 三路合并
 
-`.gitignore` 的管理段放在文件末尾，保留其他规则，并随 `layerDir` 更新：
+认领时保存 AI 当时的正文作为快照。`sync` 使用快照、作者当前正文和 AI 当前正文做逐行三路合并：不同位置的改动自动合并；重叠修改或同一基线位置的双方插入生成冲突标记，保留两份内容：
+
+同步先读取、校验并计算全部认领项，全部成功后才统一执行路径迁移、正文和快照写入。adapter、配置或模板错误会中止本次同步，保留原正文与快照；逐项提示在成功写入后输出。
+
+文件中的标记依次为 `<<<<<<< 我的写法`、`=======`、`>>>>>>> AI新改`，中间分别保留作者内容和 AI 内容。
+
+你确定采用的内容后删除标记。大替换块与多个小替换块及传递重叠修改组成一个完整冲突段，保留段内未改动行。同位置插入即使文字相同也按冲突处理，交由作者决定。
+
+## Git 隐私保护
+
+工具会把管理段放到 `.gitignore` 末尾，保留其他规则，并随 `layerDir` 更新：
 
 ```gitignore
 # author-layer private content (managed)
@@ -89,8 +176,10 @@ import { applyAuthorLayer, applyAuthorCardFields } from './tools/author-layer.mj
 # end author-layer private content
 ```
 
-Git 忽略规则保护未跟踪文件。已经被 Git 跟踪的私人文件，需要由你从 Git 索引中移除；历史提交中的内容不受忽略规则影响。
+忽略规则保护未跟踪文件。已经被 Git 跟踪的私人文件需要由你从索引移除；历史提交中的内容不受忽略规则影响。
 
-## 测试
+## 协议依据与验证
 
-在本仓库运行 `node --test tests/author-layer.test.mjs`，验证三路合并、Git 忽略规则、认领与停用恢复、模板错误及封装器导入。测试使用临时项目和 Node 内置测试模块，Git 忽略检查需要本机安装 Git。
+协议依据：[ai4rpg/tavern-cards state schema](https://github.com/ai4rpg/tavern-cards/blob/e28fb561f114a4c0636921878c245e5fc181bf33/tavern-cards/references/type/state.ts) 和同一提交的 [forge 组装实现](https://github.com/ai4rpg/tavern-cards/blob/e28fb561f114a4c0636921878c245e5fc181bf33/tavern-cards/scripts/tavern-cards-forge.mjs)。这是离线构建协议对齐，封装调用需在目标项目接入；酒馆运行时扩展不参与此工具执行。
+
+运行 `node --test`、对 `tools/author-layer.mjs`、`tools/adapters/*.mjs`、`tests/author-layer.test.mjs` 逐个执行 `node --check`，以及 `git diff --check`。测试覆盖无 UID 清单、重名源文件、state 文本字段、多开场白、组合正文、合并冲突簇、旧布局迁移、Git 忽略规则、停用恢复和模板错误。测试使用临时项目，Git 忽略检查需要本机安装 Git。
