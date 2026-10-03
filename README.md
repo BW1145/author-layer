@@ -15,7 +15,7 @@ tools/author-layer.mjs
 author-layer.config.json     （可选；不放就用内置默认值）
 ```
 
-前提是机器上有 `node`（`node --version` 能跑通）。装好后双击 `我的改动.cmd` 打开菜单。目标项目里原有的 `AGENTS.md` 会被补上作者层规则段，没有就新建一个；`CLAUDE.md` 只在它本来就存在时才同步。
+前提是机器上有 `node`（`node --version` 能跑通）。装好后双击 `我的改动.cmd` 打开菜单。目标项目里原有的 `AGENTS.md` 会被补上作者层规则段，没有就新建一个；`CLAUDE.md` 只在它本来就存在时才同步。工具每次运行或被封装器导入时，也会确保 `.gitignore` 包含当前 `layerDir` 的忽略规则；更新时提示写到 stderr，`count`、`layer` 的 stdout 格式保持原样。
 
 ## 目录约定
 
@@ -35,7 +35,7 @@ author-layer.config.json     （可选；不放就用内置默认值）
 
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
-| `layerDir` | `作者层` | 存放你自己内容的目录名 |
+| `layerDir` | `作者层` | 存放你自己内容的项目内子目录，也支持嵌套目录；同步写入 `.gitignore` 管理段 |
 | `stateFile` | `tavern-cards-state.json` | 清单文件；不在时按空清单运行 |
 | `cardConfigFile` | `card-build.config.json` | 从这里读 `inputs.cardTemplate` 拿卡面底稿 |
 | `ruleFiles` | `["AGENTS.md", "CLAUDE.md"]` | 写入作者层规则的文件；第一个不存在会创建，其余只在已存在时同步 |
@@ -43,6 +43,8 @@ author-layer.config.json     （可选；不放就用内置默认值）
 | `ruleMarkdown` | 内置那段 | 整段替换写进规则文件的正文（两行标记由工具自己加） |
 
 清单文件（`stateFile`）用 `entryManifest` 分组列出条目，每条带 `path`（源文件路径）和 `uid`。`projectName` 和 `description` 就是名称、描述的底稿；`first_messages` 是开场白源文件路径的列表，取第一个当开场白底稿。`性格`、`场景`、`对话示例` 三个字段的底稿来自卡面模板里的 `data`。
+
+配置的 `cardFields` 若只包含 `name`、`description`、`first_mes`，或为空，只需 state；包含其他字段时，需要合法的 `cardConfigFile`、`inputs.cardTemplate` 路径和带 `data` 对象的模板 JSON。缺失文件或格式错误会显示具体路径与原因，并中止操作。
 
 ## 命令
 
@@ -71,8 +73,24 @@ import { applyAuthorLayer, applyAuthorCardFields } from './tools/author-layer.mj
 
 ## 同步是怎么合的
 
-认领时记一份 AI 当时的正文当底稿。之后 AI 改了原稿、你也改了自己的文件，`sync` 拿这三份做三路合并：两边改到不同位置自动并；只有改到同一段才在文件里插 `<<<<<<< 我的写法` / `=======` / `>>>>>>> AI新改` 三行标记，两份都留着，你改完删掉标记即可。
+认领时记一份 AI 当时的正文当底稿。之后 AI 改了原稿、你也改了自己的文件，`sync` 拿这三份做三路合并：两边改到不同位置自动并；只有改到同一段才在文件里插 `<<<<<<< 我的写法` / `=======` / `>>>>>>> AI新改` 三行标记，两份都留着，你改完删掉标记即可。多处传递重叠的修改会组成一个完整冲突段，保留双方修改及段内未改动的行。
 
 ## 注意
 
 `作者层/` 里是私人内容。工具只按文件名对应关系读写，不做内容检查；`作者层/条目/` 或 `作者层/卡面/` 里出现清单里没有的名字时，会直接报错停下，避免悄悄失效。
+
+认领、停用和恢复以清单条目及配置的卡面字段为准，支持 `.md`、`.json` 等扩展名。移动前会验证认领文件与全部目标路径，目标有同名文件就报错，保留现有文件；编辑器临时文件和无关子目录不参与移动。
+
+`.gitignore` 的管理段放在文件末尾，保留其他规则，并随 `layerDir` 更新：
+
+```gitignore
+# author-layer private content (managed)
+/作者层/
+# end author-layer private content
+```
+
+Git 忽略规则保护未跟踪文件。已经被 Git 跟踪的私人文件，需要由你从 Git 索引中移除；历史提交中的内容不受忽略规则影响。
+
+## 测试
+
+在本仓库运行 `node --test tests/author-layer.test.mjs`，验证三路合并、Git 忽略规则、认领与停用恢复、模板错误及封装器导入。测试使用临时项目和 Node 内置测试模块，Git 忽略检查需要本机安装 Git。

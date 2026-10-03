@@ -55,7 +55,7 @@ function readConfig() {
 
 const config = readConfig();
 
-const layerDir = path.join(root, config.layerDir);
+const layerDir = path.resolve(root, String(config.layerDir).replace(/\\/g, '/'));
 const entryDir = path.join(layerDir, '条目');
 const cardDir = path.join(layerDir, '卡面');
 const snapshotDir = path.join(layerDir, '快照');
@@ -63,7 +63,35 @@ const pausedDir = path.join(layerDir, '停用');
 const statePath = path.join(root, config.stateFile);
 const configPath = path.join(root, config.cardConfigFile);
 const cardFields = config.cardFields;
-const layerExtensions = new Set(['.txt', '.ejs', '.yaml', '.yml']);
+
+function ensureGitIgnore() {
+  const relative = path.relative(root, layerDir).split(path.sep).join('/');
+  assert.ok(relative && relative !== '..' && !relative.startsWith('../') && !path.isAbsolute(relative)
+    && !/[\r\n]/.test(relative), 'layerDir 必须是项目根下的子目录。');
+  const file = path.join(root, '.gitignore');
+  const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const start = '# author-layer private content (managed)';
+  const end = '# end author-layer private content';
+  const pattern = `/${relative.replace(/([\\*?\[\] ])/g, '\\$1')}/`;
+  const block = [start, pattern, end].join(eol);
+  const lines = text.split(/\r?\n/);
+  const startLine = lines.indexOf(start);
+  const endLine = lines.indexOf(end);
+  assert.ok((startLine === -1 && endLine === -1) || (startLine >= 0 && endLine > startLine),
+    '.gitignore 的 author-layer 管理段标记不完整，请修复后重试。');
+  // 管理段置于末尾，避免后面的反向规则重新放行私人目录。
+  const rest = startLine >= 0
+    ? [...lines.slice(0, startLine), ...lines.slice(endLine + 1)].join(eol)
+    : text;
+  const updated = `${rest}${rest && !rest.endsWith('\n') ? eol : ''}${block}${eol}`;
+  if (updated !== text) {
+    writeText(file, updated);
+    console.error(`提示：已在 .gitignore 中保护 ${config.layerDir}/ 私人内容。`);
+  }
+}
+
+ensureGitIgnore();
 
 const ruleStart = '<!-- 作者层规则 开始';
 const ruleEnd = '<!-- 作者层规则 结束 -->';
@@ -114,12 +142,23 @@ function stateNote() {
 }
 
 function readBaselineCard() {
-  try {
-    const cardConfig = JSON.parse(readText(configPath));
-    return JSON.parse(readText(relativePath(cardConfig.inputs.cardTemplate)));
-  } catch {
-    return { data: {} };
-  }
+  const readJson = (file) => {
+    assert.ok(fs.existsSync(file), `找不到文件：${file}`);
+    const text = readText(file);
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new Error(`${file} 不是合法 JSON：${error.message}`);
+    }
+  };
+  const cardConfig = readJson(configPath);
+  const template = cardConfig?.inputs?.cardTemplate;
+  assert.ok(typeof template === 'string' && template.trim(), `${configPath} 缺少有效的 inputs.cardTemplate 路径。`);
+  const templatePath = relativePath(template);
+  const card = readJson(templatePath);
+  assert.ok(card?.data && typeof card.data === 'object' && !Array.isArray(card.data),
+    `${templatePath} 缺少有效的 data 对象。`);
+  return card;
 }
 
 // 清单条目按文件名索引；重名的条目跳过，避免认错。
@@ -146,7 +185,8 @@ function manifestEntries() {
 // 可以归你的东西有两类：卡面基础信息，以及清单里的世界书条目。
 function claimTargets() {
   const state = readState();
-  const card = readBaselineCard();
+  const stateFields = new Set(['name', 'description', 'first_mes']);
+  const card = cardFields.some((field) => !stateFields.has(field.key)) ? readBaselineCard() : null;
   const rows = [];
   for (const field of cardFields) {
     rows.push({
@@ -187,30 +227,39 @@ function claimTargets() {
   return rows;
 }
 
-function layerFiles(dir) {
+function layerFiles(dir, knownNames) {
   if (!fs.existsSync(dir)) return [];
   return fs
-    .readdirSync(dir)
-    .filter((name) => !name.startsWith('.') && !name.startsWith('~') && layerExtensions.has(path.extname(name).toLowerCase()))
+    .readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && (knownNames.has(entry.name)
+      || (!entry.name.startsWith('.') && !entry.name.startsWith('~'))))
+    .map((entry) => entry.name)
     .sort();
 }
 
 // 归你的 = 你的目录里有这个文件。目录里出现对不上号的文件就直接报错，避免悄悄失效。
-function claimedItems() {
+function claimedItems(paused = false) {
   const rows = claimTargets();
   const knownEntries = new Set(rows.filter((row) => row.kind === 'entry').map((row) => row.name));
-  for (const name of layerFiles(entryDir)) {
+  const entries = paused ? path.join(pausedDir, '条目') : entryDir;
+  const cards = paused ? path.join(pausedDir, '卡面') : cardDir;
+  for (const name of layerFiles(entries, knownEntries)) {
     if (!knownEntries.has(name)) {
-      throw new Error(`${config.layerDir}/条目/${name} 在清单里找不到同名条目。改回清单里的文件名，或删除这个文件。`);
+      throw new Error(`${path.relative(root, entries)}/${name} 在清单里找不到同名条目。改回清单里的文件名，或删除这个文件。`);
     }
   }
   const knownCards = new Set(rows.filter((row) => row.kind === 'card').map((row) => row.name));
-  for (const name of layerFiles(cardDir)) {
+  for (const name of layerFiles(cards, knownCards)) {
     if (!knownCards.has(name)) {
-      throw new Error(`${config.layerDir}/卡面/${name} 不是卡面字段。可用：${[...knownCards].join('、')}`);
+      throw new Error(`${path.relative(root, cards)}/${name} 不是卡面字段。可用：${[...knownCards].join('、')}`);
     }
   }
-  return rows.filter((row) => fs.existsSync(row.mine));
+  return rows.filter((row) => {
+    const file = paused ? path.join(pausedDir, row.kind === 'card' ? '卡面' : '条目', row.name) : row.mine;
+    if (!fs.existsSync(file)) return false;
+    assert.ok(fs.lstatSync(file).isFile(), `认领项必须是普通文件：${file}`);
+    return true;
+  });
 }
 
 // 组装世界书时把作者层正文盖到对应条目上；这一步之后卡内世界书与独立世界书都由同一条路径派生。
@@ -302,12 +351,40 @@ export function mergeThree(base, mine, theirs) {
     const mineHunk = mineHunks[mineIndex];
     const theirHunk = theirHunks[theirIndex];
     if (mineHunk && theirHunk && clash(mineHunk, theirHunk)) {
-      emitBaseUntil(Math.min(mineHunk.start, theirHunk.start));
-      lines.push(conflictStart, ...mineHunk.lines, conflictMiddle, ...theirHunk.lines, conflictEnd);
-      cursor = Math.max(mineHunk.end, theirHunk.end);
-      conflicts += 1;
+      const mineCluster = [mineHunk];
+      const theirCluster = [theirHunk];
       mineIndex += 1;
       theirIndex += 1;
+      // 收齐传递重叠的修改，直到双方都不能再扩展冲突簇。
+      let expanded;
+      do {
+        expanded = false;
+        while (mineIndex < mineHunks.length && theirCluster.some((hunk) => clash(mineHunks[mineIndex], hunk))) {
+          mineCluster.push(mineHunks[mineIndex++]);
+          expanded = true;
+        }
+        while (theirIndex < theirHunks.length && mineCluster.some((hunk) => clash(theirHunks[theirIndex], hunk))) {
+          theirCluster.push(theirHunks[theirIndex++]);
+          expanded = true;
+        }
+      } while (expanded);
+      const cluster = [...mineCluster, ...theirCluster];
+      const start = Math.min(...cluster.map((hunk) => hunk.start));
+      const end = Math.max(...cluster.map((hunk) => hunk.end));
+      const render = (hunks) => {
+        const result = [];
+        let position = start;
+        for (const hunk of hunks) {
+          result.push(...base.slice(position, hunk.start), ...hunk.lines);
+          position = hunk.end;
+        }
+        result.push(...base.slice(position, end));
+        return result;
+      };
+      emitBaseUntil(start);
+      lines.push(conflictStart, ...render(mineCluster), conflictMiddle, ...render(theirCluster), conflictEnd);
+      cursor = end;
+      conflicts += 1;
       continue;
     }
     const takeMine = !theirHunk || (mineHunk && mineHunk.start <= theirHunk.start);
@@ -473,43 +550,41 @@ function commandLayer() {
 }
 
 function pausedNames() {
-  return [...layerFiles(path.join(pausedDir, '条目')), ...layerFiles(path.join(pausedDir, '卡面'))];
+  return claimedItems(true).map((row) => row.name);
 }
 
-function moveFiles(names, fromDir, toDir) {
-  if (names.length === 0) return;
-  fs.mkdirSync(toDir, { recursive: true });
-  for (const name of names) {
-    const target = path.join(toDir, name);
-    assert.ok(!fs.existsSync(target), `目标已存在同名文件：${target}`);
-    fs.renameSync(path.join(fromDir, name), target);
+function moveItems(items, pause) {
+  const moves = items.map((row) => {
+    const paused = path.join(pausedDir, row.kind === 'card' ? '卡面' : '条目', row.name);
+    return pause ? { from: row.mine, to: paused } : { from: paused, to: row.mine };
+  });
+  for (const { to } of moves) assert.ok(!fs.existsSync(to), `目标已存在同名文件：${to}`);
+  for (const { from, to } of moves) {
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.renameSync(from, to);
   }
 }
 
 // 停用：把文件挪出 条目/ 与 卡面/，封装就不带；文件内容不动。
 function commandPause() {
-  const entryNames = layerFiles(entryDir);
-  const cardNames = layerFiles(cardDir);
-  if (entryNames.length + cardNames.length === 0) {
+  const items = claimedItems();
+  if (items.length === 0) {
     const paused = pausedNames().length;
     console.log(paused > 0 ? `已经是停用状态：${paused} 项在 ${config.layerDir}/停用/，封装不会带上。` : '你还没有认领任何东西。');
     return;
   }
-  moveFiles(entryNames, entryDir, path.join(pausedDir, '条目'));
-  moveFiles(cardNames, cardDir, path.join(pausedDir, '卡面'));
-  console.log(`已停用 ${entryNames.length + cardNames.length} 项：这次封装不会带上你的内容（文件在 ${config.layerDir}/停用/，随时恢复）。`);
+  moveItems(items, true);
+  console.log(`已停用 ${items.length} 项：这次封装不会带上你的内容（文件在 ${config.layerDir}/停用/，随时恢复）。`);
 }
 
 function commandResume() {
-  const entryNames = layerFiles(path.join(pausedDir, '条目'));
-  const cardNames = layerFiles(path.join(pausedDir, '卡面'));
-  if (entryNames.length + cardNames.length === 0) {
+  const items = claimedItems(true);
+  if (items.length === 0) {
     console.log('没有停用的内容需要恢复。');
     return;
   }
-  moveFiles(entryNames, path.join(pausedDir, '条目'), entryDir);
-  moveFiles(cardNames, path.join(pausedDir, '卡面'), cardDir);
-  console.log(`已恢复 ${entryNames.length + cardNames.length} 项：封装会带上你的版本。`);
+  moveItems(items, false);
+  console.log(`已恢复 ${items.length} 项：封装会带上你的版本。`);
 }
 
 function commandToggle() {
@@ -545,6 +620,7 @@ function commandInstallRule() {
     if (result === 'appended') notes.push(`${file}：已补上作者层规则`);
   });
   console.log(notes.length > 0 ? notes.join('\n') : '作者层规则已是当前版本。');
+  console.log(`.gitignore 已加入 ${config.layerDir}/ 的 Git 忽略保护。`);
 }
 
 // 供启动脚本列出「归我的」编号、名字、路径。
