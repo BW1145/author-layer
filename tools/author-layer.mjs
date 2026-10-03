@@ -4,23 +4,17 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import * as tavernCards from './adapters/tavern-cards.mjs';
+import * as templateCompat from './adapters/template-compat.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const configFileName = 'author-layer.config.json';
+const adapters = { 'tavern-cards': tavernCards, 'template-compat': templateCompat };
 
 const defaults = {
   layerDir: '作者层',
-  stateFile: 'tavern-cards-state.json',
-  cardConfigFile: 'card-build.config.json',
+  adapter: 'tavern-cards',
   ruleFiles: ['AGENTS.md', 'CLAUDE.md'],
-  cardFields: [
-    { key: 'name', file: '名称.txt', label: '卡面 · 名称' },
-    { key: 'description', file: '描述.txt', label: '卡面 · 描述' },
-    { key: 'personality', file: '性格.txt', label: '卡面 · 性格' },
-    { key: 'scenario', file: '场景.txt', label: '卡面 · 场景' },
-    { key: 'first_mes', file: '开场白.txt', label: '卡面 · 开场白' },
-    { key: 'mes_example', file: '对话示例.txt', label: '卡面 · 对话示例' },
-  ],
 };
 
 const normalize = (raw) => raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
@@ -29,23 +23,27 @@ const writeText = (file, value) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, value, 'utf8');
 };
+function readJson(file) {
+  assert.ok(fs.existsSync(file), `找不到文件：${file}`);
+  try {
+    return JSON.parse(readText(file));
+  } catch (error) {
+    throw new Error(`${file} 不是合法 JSON：${error.message}`);
+  }
+}
 
 function readConfig() {
   const file = path.join(root, configFileName);
-  if (!fs.existsSync(file)) return { ...defaults };
-  let raw;
-  try {
-    raw = JSON.parse(readText(file));
-  } catch (error) {
-    throw new Error(`${configFileName} 不是合法 JSON：${error.message}`);
-  }
-  const config = { ...defaults, ...raw };
+  const raw = fs.existsSync(file) ? readJson(file) : {};
+  const selected = raw.adapter ?? defaults.adapter;
+  assert.ok(Object.hasOwn(adapters, selected), `未知 adapter：${selected}。可用：${Object.keys(adapters).join('、')}`);
+  const config = { ...defaults, ...adapters[selected].defaults, ...raw };
   config.ruleFiles = (raw.ruleFiles ?? defaults.ruleFiles).map(String);
-  config.cardFields = (raw.cardFields ?? defaults.cardFields).map((field) => {
+  config.cardFields = config.cardFields.map((field) => {
     const key = String(field.key);
     return {
       key,
-      file: String(field.file ?? `${key}.txt`),
+      file: String(field.file ?? `${key}.txt`).replace(/\\/g, '/'),
       label: String(field.label ?? `卡面 · ${key}`),
     };
   });
@@ -60,9 +58,7 @@ const entryDir = path.join(layerDir, '条目');
 const cardDir = path.join(layerDir, '卡面');
 const snapshotDir = path.join(layerDir, '快照');
 const pausedDir = path.join(layerDir, '停用');
-const statePath = path.join(root, config.stateFile);
-const configPath = path.join(root, config.cardConfigFile);
-const cardFields = config.cardFields;
+const adapter = adapters[config.adapter].createAdapter({ root, config, readText, readJson });
 
 function ensureGitIgnore() {
   const relative = path.relative(root, layerDir).split(path.sep).join('/');
@@ -105,7 +101,7 @@ function defaultRuleLines() {
     '',
     `- 遇到跟作者层有关的事（某条归谁、AI 改过什么、要不要合并、成品里某个字段是谁的版本），默认交回给用户处理，不要自己去作者层找答案，也不要替用户动作者层里的文件。`,
     `- 交付、全卡检查、审计、一致性核对、装机测试、排查差异等任务的工作范围默认都不含作者层。不要为了确认成品、提高把握或找差异去读它。`,
-    `- 组装时用「${dir}/条目/」的同名正文覆盖清单条目，用「${dir}/卡面/」覆盖卡面字段。合并由脚本自动完成，你不需要知道里面的内容；成品以用户版本为准是设计，不是异常。`,
+    `- 组装时由 adapter 按清单身份把「${dir}/条目/」正文覆盖到对应条目，用「${dir}/卡面/」覆盖卡面字段。合并由脚本自动完成，你不需要知道里面的内容；成品以用户版本为准是设计，不是异常。`,
     `- 不要把它写进交付说明、更新记录或对话回复。`,
     '- 只能看名字和状态，不能看内容：node tools/author-layer.mjs status。改动某条公开源之前先看它是否已被认领；已认领的内容只有用户明确要求时才动。',
     '- 认领、同步、停用与恢复、取消认领由用户自己用启动器完成，AI 不代跑 claim、sync、toggle、release。',
@@ -132,160 +128,128 @@ const conflictStart = '<<<<<<< 我的写法';
 const conflictMiddle = '=======';
 const conflictEnd = '>>>>>>> AI新改';
 
-const relativePath = (value) => path.join(root, String(value).replace(/\\/g, '/'));
-
-// 清单文件不在就当空清单，这样工具可以放进任何工作区先跑起来。
-const readState = () => (fs.existsSync(statePath) ? JSON.parse(readText(statePath)) : {});
-
 function stateNote() {
-  if (!fs.existsSync(statePath)) console.log(`提示：根目录没有 ${config.stateFile}，清单按空处理，可认领项只有卡面字段。`);
+  const note = adapter.note();
+  if (note) console.log(note);
 }
 
-function readBaselineCard() {
-  const readJson = (file) => {
-    assert.ok(fs.existsSync(file), `找不到文件：${file}`);
-    const text = readText(file);
-    try {
-      return JSON.parse(text);
-    } catch (error) {
-      throw new Error(`${file} 不是合法 JSON：${error.message}`);
-    }
+const section = (row) => row.kind === 'card' ? '卡面' : '条目';
+const pausedFile = (row) => path.join(pausedDir, section(row), row.name);
+
+function layerFiles(dir, prefix = '', knownNames = new Set()) {
+  if (!fs.existsSync(dir)) return [];
+  const files = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const name = prefix ? prefix + '/' + entry.name : entry.name;
+    if ((entry.name.startsWith('.') || entry.name.startsWith('~'))
+      && ![...knownNames].some((known) => known === name || known.startsWith(name + '/'))) continue;
+    if (entry.isDirectory()) files.push(...layerFiles(path.join(dir, entry.name), name, knownNames));
+    else files.push(name);
+  }
+  return files.sort();
+}
+
+// 先检查所有旧正文/停用/快照，再执行迁移。歧义和已有目标都保留原文件。
+function migrateLegacy(rows) {
+  const entries = rows.filter((row) => row.kind === 'entry');
+  const legacyNames = new Set(entries.map((row) => row.legacyName).filter(Boolean));
+  const moves = new Map();
+  const addMove = (from, to) => {
+    if (!fs.existsSync(from) || from === to) return;
+    assert.ok(fs.lstatSync(from).isFile(), '旧作者层项必须是普通文件：' + from);
+    assert.ok(!fs.existsSync(to), '迁移目标已存在，原文件已保留：' + to);
+    assert.ok(!moves.has(from) || moves.get(from) === to, '旧快照身份有歧义，原文件已保留：' + from);
+    moves.set(from, to);
   };
-  const cardConfig = readJson(configPath);
-  const template = cardConfig?.inputs?.cardTemplate;
-  assert.ok(typeof template === 'string' && template.trim(), `${configPath} 缺少有效的 inputs.cardTemplate 路径。`);
-  const templatePath = relativePath(template);
-  const card = readJson(templatePath);
-  assert.ok(card?.data && typeof card.data === 'object' && !Array.isArray(card.data),
-    `${templatePath} 缺少有效的 data 对象。`);
-  return card;
-}
-
-// 清单条目按文件名索引；重名的条目跳过，避免认错。
-function manifestEntries() {
-  const state = readState();
-  const manifest = state.entryManifest ?? {};
-  const byName = new Map();
-  const duplicated = new Set();
-  for (const [group, items] of Object.entries(manifest)) {
-    for (const [comment, entry] of Object.entries(items)) {
-      const source = String(entry.path).replace(/\\/g, '/');
-      const name = path.posix.basename(source);
-      if (byName.has(name)) {
-        duplicated.add(name);
-        continue;
-      }
-      byName.set(name, { name, uid: Number(entry.uid), comment, group, source });
+  const findLegacy = (name, file) => {
+    const matches = entries.filter((row) => row.legacyName === name);
+    assert.ok(matches.length === 1,
+      file + ' 无法唯一迁移到 manifest 身份，原文件已保留。请备份作者层，按 list 显示的类型和条目名确认归属，'
+      + '将旧正文及快照一起移到对应的新路径后重试。候选：'
+      + (matches.map((row) => row.name).join('、') || '当前清单无对应条目'));
+    return matches[0];
+  };
+  for (const dir of [entryDir, path.join(pausedDir, '条目')]) {
+    for (const name of layerFiles(dir, '', legacyNames).filter((name) => !name.includes('/'))) {
+      const from = path.join(dir, name);
+      const row = findLegacy(name, from);
+      addMove(from, path.join(dir, row.name));
+      const oldSnapshot = path.join(snapshotDir, name);
+      assert.ok(!rows.some((other) => other.kind === 'card' && other.snapshot === oldSnapshot)
+        || !fs.existsSync(oldSnapshot), '旧快照与卡面快照重名，原文件已保留：' + oldSnapshot);
+      addMove(oldSnapshot, row.snapshot);
     }
   }
-  for (const name of duplicated) byName.delete(name);
-  return { byName, duplicated };
+  const cardSnapshots = new Set(rows.filter((row) => row.kind === 'card').map((row) => path.relative(snapshotDir, row.snapshot)));
+  for (const name of layerFiles(snapshotDir, '', new Set([...legacyNames, ...cardSnapshots]))
+    .filter((name) => !name.includes('/') && !cardSnapshots.has(name))) {
+    const from = path.join(snapshotDir, name);
+    const row = findLegacy(name, from);
+    addMove(from, row.snapshot);
+  }
+  const destinations = new Set();
+  for (const to of moves.values()) {
+    const key = to.toLowerCase();
+    assert.ok(!destinations.has(key), '多个旧文件映射到同一迁移目标，原文件已保留：' + to);
+    destinations.add(key);
+  }
+  for (const [from, to] of moves) {
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.renameSync(from, to);
+    console.error('提示：已迁移作者层路径 ' + path.relative(root, from) + ' → ' + path.relative(root, to));
+  }
 }
 
-// 可以归你的东西有两类：卡面基础信息，以及清单里的世界书条目。
-function claimTargets() {
-  const state = readState();
-  const stateFields = new Set(['name', 'description', 'first_mes']);
-  const card = cardFields.some((field) => !stateFields.has(field.key)) ? readBaselineCard() : null;
-  const rows = [];
-  for (const field of cardFields) {
-    rows.push({
-      kind: 'card',
-      key: field.key,
-      name: field.file,
-      label: field.label,
-      group: '卡面',
-      comment: field.label,
-      mine: path.join(cardDir, field.file),
-      snapshot: path.join(snapshotDir, `卡面-${field.file}`),
-      // AI 那一份的当前正文：卡面字段各有各的出处。
-      aiText: () => {
-        if (field.key === 'name') return String(state.projectName ?? '');
-        if (field.key === 'description') return String(state.description ?? '');
-        if (field.key === 'first_mes') {
-          const [message] = state.first_messages ?? [];
-          return message ? readText(relativePath(message)) : '';
-        }
-        return String(card.data?.[field.key] ?? '');
-      },
-    });
+function claimTargets(migrate = true) {
+  const rows = adapter.discover().map((row) => ({
+    ...row,
+    mine: path.join(row.kind === 'card' ? cardDir : entryDir, row.name),
+    snapshot: path.join(snapshotDir, row.kind === 'card' ? '卡面-' + row.name : '条目/' + row.name),
+  }));
+  const identities = new Set();
+  const files = new Set();
+  for (const row of rows) {
+    assert.ok(!identities.has(row.id), 'adapter 返回了重复身份：' + row.id);
+    identities.add(row.id);
+    const relative = path.relative(row.kind === 'card' ? cardDir : entryDir, row.mine);
+    assert.ok(relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative),
+      '作者文件必须位于对应目录内：' + row.name);
+    // Windows 的大小写规则也在其他平台上检查。
+    const file = row.mine.toLowerCase();
+    assert.ok(!files.has(file), '作者文件路径碰撞：' + row.name);
+    files.add(file);
   }
-  const { byName } = manifestEntries();
-  for (const entry of byName.values()) {
-    rows.push({
-      kind: 'entry',
-      uid: entry.uid,
-      name: entry.name,
-      label: `${entry.group} · ${entry.name}`,
-      group: entry.group,
-      comment: entry.comment,
-      mine: path.join(entryDir, entry.name),
-      snapshot: path.join(snapshotDir, entry.name),
-      aiText: () => readText(relativePath(entry.source)),
-    });
-  }
+  if (migrate) migrateLegacy(rows);
   return rows;
 }
 
-function layerFiles(dir, knownNames) {
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && (knownNames.has(entry.name)
-      || (!entry.name.startsWith('.') && !entry.name.startsWith('~'))))
-    .map((entry) => entry.name)
-    .sort();
-}
-
-// 归你的 = 你的目录里有这个文件。目录里出现对不上号的文件就直接报错，避免悄悄失效。
+// 目录里出现无法对应当前协议的文件就报错，防止删除/重命名条目后悄悄失效。
 function claimedItems(paused = false) {
   const rows = claimTargets();
-  const knownEntries = new Set(rows.filter((row) => row.kind === 'entry').map((row) => row.name));
-  const entries = paused ? path.join(pausedDir, '条目') : entryDir;
-  const cards = paused ? path.join(pausedDir, '卡面') : cardDir;
-  for (const name of layerFiles(entries, knownEntries)) {
-    if (!knownEntries.has(name)) {
-      throw new Error(`${path.relative(root, entries)}/${name} 在清单里找不到同名条目。改回清单里的文件名，或删除这个文件。`);
-    }
-  }
-  const knownCards = new Set(rows.filter((row) => row.kind === 'card').map((row) => row.name));
-  for (const name of layerFiles(cards, knownCards)) {
-    if (!knownCards.has(name)) {
-      throw new Error(`${path.relative(root, cards)}/${name} 不是卡面字段。可用：${[...knownCards].join('、')}`);
+  for (const kind of ['entry', 'card']) {
+    const known = new Set(rows.filter((row) => row.kind === kind).map((row) => row.name));
+    const dir = paused ? path.join(pausedDir, kind === 'card' ? '卡面' : '条目')
+      : kind === 'card' ? cardDir : entryDir;
+    for (const name of layerFiles(dir, '', known)) {
+      assert.ok(known.has(name), path.relative(root, dir) + '/' + name
+        + ' 在当前清单里找不到对应身份。请恢复清单或备份并迁移这个文件。');
     }
   }
   return rows.filter((row) => {
-    const file = paused ? path.join(pausedDir, row.kind === 'card' ? '卡面' : '条目', row.name) : row.mine;
+    const file = paused ? pausedFile(row) : row.mine;
     if (!fs.existsSync(file)) return false;
-    assert.ok(fs.lstatSync(file).isFile(), `认领项必须是普通文件：${file}`);
+    assert.ok(fs.lstatSync(file).isFile(), '认领项必须是普通文件：' + file);
     return true;
   });
 }
 
-// 组装世界书时把作者层正文盖到对应条目上；这一步之后卡内世界书与独立世界书都由同一条路径派生。
-export function applyAuthorLayer(worldbook) {
-  let count = 0;
-  for (const item of claimedItems()) {
-    if (item.kind !== 'entry') continue;
-    const key = Object.keys(worldbook.entries).find((candidate) => Number(worldbook.entries[candidate].uid) === item.uid);
-    assert.ok(key, `${config.layerDir}/条目/${item.name} 对应的条目（UID ${item.uid}）不在本次组装结果里，已中止封装。`);
-    worldbook.entries[key].content = readText(item.mine);
-    count += 1;
-  }
-  return count;
+// 核心只提供已认领文件；成品定位和字段写入由 adapter 负责。
+export function applyAuthorLayer(worldbook, options) {
+  return adapter.applyEntries(worldbook, claimedItems().filter((item) => item.kind === 'entry'), options);
 }
 
-// 卡面基础信息：你的文件在，就以你的为准。
 export function applyAuthorCardFields(card) {
-  let count = 0;
-  for (const item of claimedItems()) {
-    if (item.kind !== 'card') continue;
-    const value = readText(item.mine);
-    card.data[item.key] = value;
-    if (item.key in card) card[item.key] = value;
-    count += 1;
-  }
-  return count;
+  return adapter.applyCard(card, claimedItems().filter((item) => item.kind === 'card'));
 }
 
 // 逐行找出 other 相对 base 的替换块。条目最多几十行，直接算最长公共子序列。
@@ -332,9 +296,8 @@ function diffHunks(base, other) {
 export function mergeThree(base, mine, theirs) {
   const mineHunks = diffHunks(base, mine);
   const theirHunks = diffHunks(base, theirs);
-  const bothInsertAt = (left, right) => left.start === left.end && right.start === right.end && left.start === right.start;
-  const clash = (left, right) => !bothInsertAt(left, right)
-    && (left.start === right.start || (left.start < right.end && right.start < left.end));
+  const clash = (left, right) => left.start === right.start
+    || (left.start < right.end && right.start < left.end);
 
   const lines = [];
   let cursor = 0;
@@ -402,31 +365,35 @@ export function mergeThree(base, mine, theirs) {
 
 function commandList(keyword) {
   stateNote();
-  const rows = claimTargets();
-  const { duplicated } = manifestEntries();
+  const rows = claimTargets(false);
   const needle = String(keyword ?? '').toLowerCase();
   const matched = rows.filter(
-    (row) => !needle || row.label.toLowerCase().includes(needle) || row.name.toLowerCase().includes(needle),
+    (row) => !needle || row.label.toLowerCase().includes(needle) || row.name.toLowerCase().includes(needle) || row.id.toLowerCase().includes(needle),
   );
   if (matched.length === 0) {
     console.log('没有匹配的条目。');
     return;
   }
   for (const row of matched) {
-    console.log(`${fs.existsSync(row.mine) ? '[归我]' : '[归AI]'} ${row.label}`);
+    const legacy = row.legacyName && [entryDir, path.join(pausedDir, '条目')]
+      .some((dir) => fs.existsSync(path.join(dir, row.legacyName)));
+    console.log(`${fs.existsSync(row.mine) ? '[归我]' : legacy ? '[旧路径待迁移]' : '[归AI]'} ${row.label}`);
+    console.log(`  作者路径：${path.relative(root, row.mine).split(path.sep).join('/')}`);
   }
   console.log(`共 ${matched.length} 项；归我的 ${rows.filter((row) => fs.existsSync(row.mine)).length} 项。`);
-  if (duplicated.size > 0) console.log(`文件名重复、暂不支持接管的条目：${[...duplicated].join('、')}`);
 }
 
 function commandClaim(keyword) {
-  const needle = String(keyword ?? '').trim().toLowerCase();
+  const original = String(keyword ?? '').trim();
+  const needle = original.toLowerCase();
   if (!needle) {
     console.log('用法：选择 1 之后输入名字的一部分。');
     return;
   }
-  const matched = claimTargets().filter(
-    (row) => row.label.toLowerCase().includes(needle) || row.name.toLowerCase().includes(needle),
+  const rows = claimTargets();
+  const exact = rows.filter((row) => [row.label, row.name, row.id, row.source].includes(original));
+  const matched = exact.length ? exact : rows.filter(
+    (row) => row.label.toLowerCase().includes(needle) || row.name.toLowerCase().includes(needle) || row.id.toLowerCase().includes(needle),
   );
   if (matched.length === 0) {
     console.log('没有匹配，用选择 3 看全部可认领项。');
@@ -442,6 +409,7 @@ function commandClaim(keyword) {
     console.log(`${row.label} 已经在你的文件里了，没有被覆盖。`);
     return;
   }
+  assert.ok(!fs.existsSync(pausedFile(row)), '这一项已停用，请先 resume 恢复：' + row.label);
   const current = row.aiText();
   writeText(row.mine, current);
   writeText(row.snapshot, current);
@@ -484,13 +452,16 @@ function commandSync() {
 
 // 取消认领：这一项还给 AI，你的正文留在 作者层/已取消/ 备查，不再参与封装。
 function commandRelease(keyword) {
-  const needle = String(keyword ?? '').trim().toLowerCase();
+  const original = String(keyword ?? '').trim();
+  const needle = original.toLowerCase();
   if (!needle) {
     console.log('用法：选择 7 之后按编号选。');
     return;
   }
-  const matched = claimTargets().filter(
-    (row) => row.label.toLowerCase().includes(needle) || row.name.toLowerCase().includes(needle),
+  const rows = claimTargets();
+  const exact = rows.filter((row) => [row.label, row.name, row.id, row.source].includes(original));
+  const matched = exact.length ? exact : rows.filter(
+    (row) => row.label.toLowerCase().includes(needle) || row.name.toLowerCase().includes(needle) || row.id.toLowerCase().includes(needle),
   );
   if (matched.length === 0) {
     console.log('没有匹配，用选择 3 看全部可认领项。');
@@ -502,16 +473,15 @@ function commandRelease(keyword) {
     return;
   }
   const [row] = matched;
-  const pausedFile = path.join(pausedDir, row.kind === 'card' ? '卡面' : '条目', row.name);
-  const from = [row.mine, pausedFile].find((file) => fs.existsSync(file));
+  const from = [row.mine, pausedFile(row)].find((file) => fs.existsSync(file));
   if (!from) {
     console.log(`${row.label} 不在你名下，不用取消。`);
     return;
   }
-  const archiveDir = path.join(layerDir, '已取消');
+  const archiveDir = path.join(layerDir, '已取消', section(row), path.dirname(row.name));
   fs.mkdirSync(archiveDir, { recursive: true });
   const extension = path.extname(row.name);
-  let archived = path.join(archiveDir, row.name);
+  let archived = path.join(archiveDir, path.basename(row.name));
   for (let n = 2; fs.existsSync(archived); n += 1) {
     archived = path.join(archiveDir, `${path.basename(row.name, extension)}-${n}${extension}`);
   }
@@ -555,7 +525,7 @@ function pausedNames() {
 
 function moveItems(items, pause) {
   const moves = items.map((row) => {
-    const paused = path.join(pausedDir, row.kind === 'card' ? '卡面' : '条目', row.name);
+    const paused = pausedFile(row);
     return pause ? { from: row.mine, to: paused } : { from: paused, to: row.mine };
   });
   for (const { to } of moves) assert.ok(!fs.existsSync(to), `目标已存在同名文件：${to}`);
