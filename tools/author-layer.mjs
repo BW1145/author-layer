@@ -441,7 +441,6 @@ function commandSync() {
   const items = claimedItems(false, rows, moves);
   const writes = [];
   const notes = [];
-  const toOpen = [];
   for (const item of items) {
     const mineText = readText(originals.get(item.mine) ?? item.mine);
     const aiText = item.aiText();
@@ -457,13 +456,12 @@ function commandSync() {
       continue;
     }
     const merged = mergeThree(snapshotText.split('\n'), mineText.split('\n'), aiText.split('\n'));
+    if (merged.conflicts > 0) {
+      notes.push(`· ${item.label}：有 ${merged.conflicts} 处冲突，本项未合并，保留你的正文。`);
+      continue;
+    }
     writes.push([item.mine, merged.lines.join('\n')], [item.snapshot, aiText]);
-    if (merged.conflicts > 0) toOpen.push(item.mine);
-    notes.push(
-      merged.conflicts === 0
-        ? `· ${item.label}：AI 的新改动已并进你的文件。`
-        : `· ${item.label}：有 ${merged.conflicts} 处双方都改到同一段，已在你的文件里用 ${conflictStart} / ${conflictMiddle} / ${conflictEnd} 标出，两份都留着，改完删掉这三行标记即可。`,
-    );
+    notes.push(`· ${item.label}：AI 的新改动已并进你的文件。`);
   }
   // 所有 adapter/config/template 读取与合并成功后，才执行迁移和写入。
   ensureGitIgnore();
@@ -471,7 +469,6 @@ function commandSync() {
   for (const [file, value] of writes) writeText(file, value);
   if (items.length === 0) notes.push('你还没有认领任何东西。');
   for (const note of notes) console.log(note);
-  for (const file of toOpen) console.log(`打开：${file}`);
 }
 
 // 取消认领：这一项还给 AI，你的正文留在 作者层/已取消/ 备查，不再参与封装。
