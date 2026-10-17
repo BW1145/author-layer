@@ -43,7 +43,7 @@ function readConfig() {
     const key = String(field.key);
     return {
       key,
-      file: String(field.file ?? `${key}.txt`).replace(/\\/g, '/'),
+      file: path.posix.normalize(String(field.file ?? `${key}.txt`).replace(/\\/g, '/')),
       label: String(field.label ?? `卡面 · ${key}`),
     };
   });
@@ -225,6 +225,11 @@ function claimTargets(migrate = true) {
     const file = row.mine.toLowerCase();
     assert.ok(!files.has(file), '作者文件路径碰撞：' + row.name);
     files.add(file);
+  }
+  for (const file of files) {
+    for (let parent = path.dirname(file); parent !== path.dirname(parent); parent = path.dirname(parent)) {
+      assert.ok(!files.has(parent), '作者文件路径碰撞（文件与目录重叠）：' + path.relative(layerDir, file));
+    }
   }
   if (migrate) migrateLegacy(rows);
   return rows;
